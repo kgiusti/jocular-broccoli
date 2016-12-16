@@ -1,2 +1,0 @@
-#!/bin/bash
-mvn -q -e exec:java -Dexec.mainClass=org.apache.qpid.proton.examples.Spout -Dexec.args="$*"
