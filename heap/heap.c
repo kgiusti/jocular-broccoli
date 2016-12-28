@@ -15,28 +15,29 @@
  */
 
 #include <types.h>
+#include <llist.h>
+
+
+// Cortex-A7 type alignment
+#define MALLOC_ALIGNMENT        8
 
 // Cortex-A7 cache line is 64 bytes
-// Since malloc'ed memory should be cache-aligned and yet have overhead bytes
-// the smallest block we can allocate is 2*cache line size
-//
 #define CACHE_LINE_POWER 6
 #define CACHE_LINE_SIZE  (1<<CACHE_LINE_POWER)
-#define MIN_BLOCK_POWER  7
-#define MIN_BLOCK_SIZE   (1<<MIN_BLOCK_POWER)
 
 
 
-#define MAGIC 0xFEEFBEEF
-#define BLOCK_FREE 0x01
+#define MAGIC_FREE 0xFEEFBEEB
+#define MAGIC_USED 0xEFFEEBBE
+#define BLOCK_MIN_SIZE  64
 
 typedef struct block_header {
-    uint32_t            magic;
-    uint32_t            flags;
-    uint32_t            size;
-    struct block_header *next;
-    // must be <= CACHE_LINE_SIZE!!
+    uint32_t            magic;  // 0..3
+    uint32_t            slot;   // 4..7
+#define HEADER_OFFSET 8
+    LIST_LINKAGE(struct block_header, list);
 } block_header_t;
+
 
 static inline int high_bit(size_t length)
 {
@@ -48,102 +49,110 @@ static inline int high_bit(size_t length)
     return bit - 1;
 }
 
+DEFINE_LIST(block_header_t, block);
 
 #define FREE_SLOTS (sizeof(void *) * 8)
-static block_header_t *heap[FREE_SLOTS];
+static block_header_list_t heap[FREE_SLOTS];
 
 static inline block_header_t *buddy(block_header_t *block)
 {
-    return (block_header_t *)((uintptr_t)block ^= block->size);
+    return (block_header_t *)((uintptr_t)block ^= block->slot);
 }
 
-static block_header_t *split_block(block_header_t *big)
+static inline block_header_t *low_buddy(block_header_t *block)
 {
-    int slot = (big->size >> 1);
-    big->size = slot;
-    block_header_t *buddy = buddy(big);
+    return (block_header_t *)((uintptr_t)block &= ~block->slot);
+}
 
-    big->next = heap[slot];
-    heap[slot] = big;
+static void split_block(block_header_t *block)
+{
+    block->slot >>= 1;
+    block_header_t *buddy = buddy(block);
 
-    buddy->magic = MAGIC;
-    buddy->size = slot;
-    buddy->flags = BLOCK_FREE;
-    buddy->next = NULL;
-    return buddy;
+    buddy->magic = MAGIC_FREE;
+    buddy->slot = block->slot;
+    LINK_INIT(buddy, list);
+    PUSH_TAIL(&heap[buddy->slot], buddy, list);
+}
+
+static block_header_t *merge_block(block_header_t *block)
+{
+    int slot = block->slot;
+    block_header_t *buddy = buddy(block);
+    if (buddy->magic == MAGIC_FREE && buddy->slot == slot) {
+        LIST_REMOVE(&heap[slot], buddy, list);
+        block = low_buddy(block);
+        block->slot <<= 1;
+        buddy(block)->magic = 0;
+        return merge_block(block);
+    }
+    return block;
 }
 
 
 void heap_init(void *start, size_t length)
 {
-    // let's assume *start is cache aligned and length is a multiple of
-    // MIN_BLOCK_SIZE
+    // let's assume *start is cache aligned and length is a multiple of 2
 
-    index = high_bit(length);
-    heap[index] = (block_header_t *)start;
-    heap[index]->magic = MAGIC;
-    heap[index]->flags = BLOCK_FREE;
-    heap[index]->size = length;
-    heap[index]->next = NULL;
+    for (int i = 0; i < FREE_SLOTS; ++i)
+        LIST_INIT(&heap[i]);
+
+    slot = high_bit(length);
+    block_header_t *block = (block_header_t *start);
+    block->magic = MAGIC_FREE;
+    block->slot = slot;
+    PUSH_TAIL(&heap[slot], block, list);
 }
+
 
 void *malloc(size_t length)
 {
-    int slot;
     if (length == 0) return NULL;
-    length += CACHE_LINE_SIZE;   // for the malloc header
-    int bit = high_bit(length);
+    length += HEADER_OFFSET;
+    if (length < BLOCK_MIN_SIZE)
+        length = BLOCK_MIN_SIZE;
+
     // round up to the next power of two:
-    if (length != (1<<bit)) {
-        length += ((1<<bit) - 1);
-        length &= ~((1<<bit) - 1);
-        if (length > (1<<bit))
-            bit += 1;
+    int slot = high_bit(length);
+    if (length > (1<<slot)) {
+        slot += 1;
     }
 
-    if (heap[bit]) {
-        void *ptr = heap[bit];
-        heap[bit] = heap[bit]->next;
-        return ((uintptr_t)ptr + CACHE_LINE_SIZE);
-    }
-
-    // find next largest free block
-    int slot = bit + 1;
-    while (slot < FREE_SLOTS && !heap[slot])
-        ++slot;
+    int index = slot;
+    while (index < FREE_SLOTS && heap[index].count == 0)
+        ++index;
 
     // TODO: assert here
-    if (slot == FREE_SLOTS) return NULL;
+    if (index == FREE_SLOTS) return NULL;
 
-    block_header_ptr *fb = heap[slot];
-    heap[slot] = fb->next;
+    block_header_ptr *block;
+    POP_HEAD(&heap[index], block, list);
 
-    while (slot > bit) {
-        fb = split_block(fb);
-        --slot;
+    while (block->slot > slot) {
+        block = split_block(block);
     }
 
-    return ((uintptr_t)fb + CACHE_LINE_SIZE);
+    block->magic = MAGIC_USED;
+    return (void *)((uintptr_t *)block + HEADER_OFFSET);
 }
 
 
 void free(void *ptr)
 {
-    block = (block_header_ptr *)ptr;
-    if (block) {
-        // assert(block->magic == MAGIC);
-        block->flags = BLOCK_FREE;
-        block_header_ptr *buddy = buddy(block);
-        while (buddy->flags == BLOCK_FREE
-               && buddy->size == block->size) {
-            // remove buddy from it's free list
-            block->size <<= 1;
-            buddy = buddy(block);
-        }
-        block->next = heap[block->size];
-        heap[block->size] = block;
+    if (ptr) {
+        block_header_ptr *block;
+        block = (block_header_ptr *)((uintptr_t)ptr - HEADER_OFFSET);
+        // assert(block->magic == MAGIC_USED);
+        block->magic = MAGIC_FREE;
+        block = merge_block(block);
+        PUSH_TAIL(&heap[block->slot], block, list);
     }
 }
 
 
+// aligned on a cache line
+void *malloc_aligned(size_t length)
+{
+    return NULL;
+}
 
