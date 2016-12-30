@@ -52,38 +52,39 @@ static inline int high_bit(size_t length)
 DEFINE_LIST(block_header_t, block);
 
 #define FREE_SLOTS (sizeof(void *) * 8)
-static block_header_list_t heap[FREE_SLOTS];
+static block_list_t heap[FREE_SLOTS];
 
-static inline block_header_t *buddy(block_header_t *block)
+static inline block_header_t *get_buddy(block_header_t *block)
 {
-    return (block_header_t *)((uintptr_t)block ^= block->slot);
+    uintptr_t ptr = (uintptr_t)block;
+    return (block_header_t *)(ptr ^= block->slot);
 }
 
 static inline block_header_t *low_buddy(block_header_t *block)
 {
-    return (block_header_t *)((uintptr_t)block &= ~block->slot);
+    uintptr_t ptr = (uintptr_t)block;
+    return (block_header_t *)(ptr &= ~block->slot);
 }
 
 static void split_block(block_header_t *block)
 {
     block->slot >>= 1;
-    block_header_t *buddy = buddy(block);
+    block_header_t *buddy = get_buddy(block);
 
     buddy->magic = MAGIC_FREE;
     buddy->slot = block->slot;
-    LINK_INIT(buddy, list);
     PUSH_TAIL(&heap[buddy->slot], buddy, list);
 }
 
 static block_header_t *merge_block(block_header_t *block)
 {
     int slot = block->slot;
-    block_header_t *buddy = buddy(block);
+    block_header_t *buddy = get_buddy(block);
     if (buddy->magic == MAGIC_FREE && buddy->slot == slot) {
         LIST_REMOVE(&heap[slot], buddy, list);
         block = low_buddy(block);
         block->slot <<= 1;
-        buddy(block)->magic = 0;
+        get_buddy(block)->magic = 0;
         return merge_block(block);
     }
     return block;
@@ -97,8 +98,8 @@ void heap_init(void *start, size_t length)
     for (int i = 0; i < FREE_SLOTS; ++i)
         LIST_INIT(&heap[i]);
 
-    slot = high_bit(length);
-    block_header_t *block = (block_header_t *start);
+    uint_t slot = high_bit(length);
+    block_header_t *block = (block_header_t *)start;
     block->magic = MAGIC_FREE;
     block->slot = slot;
     PUSH_TAIL(&heap[slot], block, list);
@@ -125,11 +126,11 @@ void *malloc(size_t length)
     // TODO: assert here
     if (index == FREE_SLOTS) return NULL;
 
-    block_header_ptr *block;
+    block_header_t *block;
     POP_HEAD(&heap[index], block, list);
 
     while (block->slot > slot) {
-        block = split_block(block);
+        split_block(block);
     }
 
     block->magic = MAGIC_USED;
@@ -140,8 +141,8 @@ void *malloc(size_t length)
 void free(void *ptr)
 {
     if (ptr) {
-        block_header_ptr *block;
-        block = (block_header_ptr *)((uintptr_t)ptr - HEADER_OFFSET);
+        block_header_t *block;
+        block = (block_header_t *)((uintptr_t)ptr - HEADER_OFFSET);
         // assert(block->magic == MAGIC_USED);
         block->magic = MAGIC_FREE;
         block = merge_block(block);
