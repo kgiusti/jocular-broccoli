@@ -14,7 +14,7 @@
  *    under the License.
  */
 
-#include <types.h>
+#include <heap.h>
 #include <llist.h>
 
 
@@ -53,22 +53,25 @@ DEFINE_LIST(block_header_t, block);
 
 #define FREE_SLOTS (sizeof(void *) * 8)
 static block_list_t heap[FREE_SLOTS];
+static uintptr_t    base_address;
 
 static inline block_header_t *get_buddy(block_header_t *block)
 {
-    uintptr_t ptr = (uintptr_t)block;
-    return (block_header_t *)(ptr ^= block->slot);
+    uintptr_t offset = base_address - (uintptr_t)block;
+    offset ^= (1<<block->slot);
+    return (block_header_t *)(base_address + offset);
 }
 
 static inline block_header_t *low_buddy(block_header_t *block)
 {
-    uintptr_t ptr = (uintptr_t)block;
-    return (block_header_t *)(ptr &= ~block->slot);
+    uintptr_t offset = base_address - (uintptr_t)block;
+    offset &= ~(1<<block->slot);
+    return (block_header_t *)(base_address + offset);
 }
 
 static void split_block(block_header_t *block)
 {
-    block->slot >>= 1;
+    --block->slot;
     block_header_t *buddy = get_buddy(block);
 
     buddy->magic = MAGIC_FREE;
@@ -83,8 +86,8 @@ static block_header_t *merge_block(block_header_t *block)
     if (buddy->magic == MAGIC_FREE && buddy->slot == slot) {
         LIST_REMOVE(&heap[slot], buddy, list);
         block = low_buddy(block);
-        block->slot <<= 1;
         get_buddy(block)->magic = 0;
+        ++block->slot;
         return merge_block(block);
     }
     return block;
@@ -95,6 +98,7 @@ void heap_init(void *start, size_t length)
 {
     // let's assume *start is cache aligned and length is a multiple of 2
 
+    base_address = (uintptr_t) start;
     for (int i = 0; i < FREE_SLOTS; ++i)
         LIST_INIT(&heap[i]);
 
@@ -134,7 +138,7 @@ void *malloc(size_t length)
     }
 
     block->magic = MAGIC_USED;
-    return (void *)((uintptr_t *)block + HEADER_OFFSET);
+    return (void *)((uintptr_t)block + HEADER_OFFSET);
 }
 
 
